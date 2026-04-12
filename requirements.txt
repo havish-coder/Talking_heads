@@ -5,7 +5,7 @@ scipy==1.11.4
 scikit_image==0.19.3
 huggingface_hub==0.20.1
 dwpose
-
+torch
 numpy
 pillow
 tqdm

@@ -11,14 +11,13 @@ import tempfile
 # ==========================================
 # CONFIGURATION
 # ==========================================
-AUDIO_DIR  = "Talking_heads\Preprocessing\audio_clips"
+AUDIO_DIR  = "audio_clips"
 OUTPUT_DIR = "audio_embeddings_wav2vec2"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SUPPORTED = {".m4a", ".wav", ".mp3", ".flac", ".ogg"}
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 # ==========================================
 # MODEL LOADING
 # ==========================================

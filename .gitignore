@@ -1,13 +1,20 @@
 # datasets
 Preprocessing/Video_WithoutAudio/
 Preprocessing/audio_clips/
-Preprocessing/processed_dataset_wholebody/
-Preprocessing/audio_embeddings/
-
+Preprocessing/audio_embedding/
+Preprocessing/reference_images/
+Preprocessing/reference_images_final_768/
+Preprocessing/ref_latents/
+Preprocessing/final_vids
 # models
 Preprocessing/dwpose_models/
-
+Preprocessing/pose_data_single/
+Preprocessing/ref_latents-20260404T043110Z-1-001
+Preprocessing/
 # python
 .venv/
 __pycache__/
 *.pyc
+
+# IDEs/Editors
+.vscode/
