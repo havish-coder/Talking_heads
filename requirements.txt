@@ -1,10 +1,10 @@
-onnxruntime==1.13.1
-onnxruntime_gpu==1.13.1
-matplotlib==3.6.2
-opencv_python==4.7.0.68
-scipy==1.11.4
-scikit_image==0.19.3
-huggingface_hub==0.20.1
+onnxruntime
+onnxruntime-gpu
+matplotlib
+opencv-python
+scipy
+scikit-image
+huggingface-hub
 dwpose
 
 numpy
@@ -13,3 +13,7 @@ tqdm
 moviepy
 torch
 rtmlib
+torchvision
+diffusers
+accelerate
+transformers
