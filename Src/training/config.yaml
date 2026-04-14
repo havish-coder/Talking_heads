@@ -21,5 +21,4 @@ log_every    : 50
 lambda_pose   : 0.1
 lambda_detail : 0.1
 lambda_low    : 0.1
-
 #python training/train.py --config training/config.yaml

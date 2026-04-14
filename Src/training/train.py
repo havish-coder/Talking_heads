@@ -33,7 +33,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from diffusers import AutoencoderKLCogVideoX, DDPMScheduler
 from transformers import Wav2Vec2Model
 from peft import LoraConfig, get_peft_model
@@ -212,7 +212,7 @@ def train(cfg: dict):
         betas        = (0.9, 0.999),
         weight_decay = 1e-2,
     )
-    scaler = GradScaler(enabled=(device.type == "cuda"))
+    scaler = GradScaler("cuda")
 
     # ── 4. DataLoader ──────────────────────────────────────────────────────
     dataset, loader = get_dataloader(
