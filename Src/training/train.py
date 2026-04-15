@@ -212,7 +212,7 @@ def train(cfg: dict):
         betas        = (0.9, 0.999),
         weight_decay = 1e-2,
     )
-    scaler = GradScaler("cuda")
+    scaler = GradScaler(enabled=(dtype == torch.float16))
 
     # ── 4. DataLoader ──────────────────────────────────────────────────────
     dataset, loader = get_dataloader(

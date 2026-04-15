@@ -233,14 +233,14 @@ class TalkingHeadsDiT(nn.Module):
         Default: True (recommended for first training stage).
     """
 
-    COGVIDEOX_INNER_DIM      = 1920   # 30 × 64
+    COGVIDEOX_INNER_DIM      = 3072   # 30 × 64
     COGVIDEOX_IN_CHANNELS    = 16
     COGVIDEOX_NUM_LAYERS     = 42
     COGVIDEOX_TEXT_EMBED_DIM = 4096   # T5 slot — we repurpose via projection
 
     def __init__(
         self,
-        inner_dim: int = 1920,
+        inner_dim: int = 3072,
         audio_input_dim: int = 3072,
         audio_tokens_per_frame: int = 4,
         pose_dropout: float = 0.1,
@@ -263,7 +263,7 @@ class TalkingHeadsDiT(nn.Module):
         #     The model is constructed here with the correct expanded in_channels.
         # ------------------------------------------------------------------
         self.backbone = CogVideoXTransformer3DModel(
-            num_attention_heads=30,
+            num_attention_heads=48,
             attention_head_dim=64,
             in_channels=32,            # 16 video + 16 ref (expanded)
             out_channels=16,           # predict noise only in video channels
@@ -406,15 +406,16 @@ class TalkingHeadsDiT(nn.Module):
         model.backbone.load_state_dict(model_sd, strict=False)
 
         # Now apply zero-init expansion for the skipped patch_embed.proj
+        # Now apply zero-init expansion ONLY for the skipped patch_embed.proj
         for key in keys_to_skip:
-            param_model = dict(model.backbone.named_parameters())[key]
-            param_pretrained = pretrained_sd[key]
-            with torch.no_grad():
-                param_model[:, :16, ...] = param_pretrained
-                param_model[:, 16:, ...] = 0.0
-
-        del pretrained
-        print("[TalkingHeadsDiT] Weights loaded. Reference conditioning zero-initialised.")
+            if key == "patch_embed.proj.weight":
+                param_model = dict(model.backbone.named_parameters())[key]
+                param_pretrained = pretrained_sd[key]
+                with torch.no_grad():
+                    param_model[:, :16, ...] = param_pretrained
+                    param_model[:, 16:, ...] = 0.0
+            else:
+                print(f"  [INFO] Expected mismatch for {key}. Leaving randomly initialized.")
 
         return model
 

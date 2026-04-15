@@ -33,7 +33,9 @@ from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import librosa
 from typing import Optional
-
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
+warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
 
 # ── APDH Stage Definitions ─────────────────────────────────────────────────
 
@@ -196,7 +198,10 @@ class TalkingHeadsDataset(Dataset):
 
         # ── 4. Audio ───────────────────────────────────────────────────────
         audio_path = self.audio_dir / f"{stem}.m4a"
-        waveform, sr = librosa.load(str(audio_path), sr=self.audio_sr, mono=True)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            waveform, sr = librosa.load(str(audio_path), sr=self.audio_sr, mono=True)
 
         samples_per_frame = self.audio_sr / 24.0
         audio_start = int(start * samples_per_frame)

@@ -4,7 +4,7 @@
 # ── Paths ──────────────────────────────────────────────────────────────────
 pretrained_model : "THUDM/CogVideoX-5b"
 wav2vec2_model   : "facebook/wav2vec2-base"
-data_root        : "../DATASET/processed_dataset_wholebody"
+data_root        : ".../DATASET"
 output_dir       : "../checkpoints"
 resume_from      : null   # path to checkpoint.pt to resume, or null
  
@@ -13,7 +13,7 @@ total_iters  : 70000
 batch_size   : 2       # increase to 4 on A100 with 40GB
 clip_frames  : 24      # 1 second at 24fps
 num_workers  : 4       # 0 for Windows, 4 for Linux/A100
-lr           : 1e-5
+lr           : 0.0001
 save_every   : 1000
 log_every    : 50
  
@@ -21,4 +21,5 @@ log_every    : 50
 lambda_pose   : 0.1
 lambda_detail : 0.1
 lambda_low    : 0.1
+
 #python training/train.py --config training/config.yaml
