@@ -1,25 +1,29 @@
 # training/config.yaml
-# Edit these paths before running on A100
- 
+# CogVideoX-2B — optimized for T4 12GB Colab
+
 # ── Paths ──────────────────────────────────────────────────────────────────
-pretrained_model : "THUDM/CogVideoX-5b"
+pretrained_model : "THUDM/CogVideoX-2b"
 wav2vec2_model   : "facebook/wav2vec2-base"
 data_root        : ".../DATASET"
 output_dir       : "../checkpoints"
-resume_from      : null   # path to checkpoint.pt to resume, or null
- 
+resume_from      : null
+
 # ── Training ───────────────────────────────────────────────────────────────
-total_iters  : 70000
-batch_size   : 2       # increase to 4 on A100 with 40GB
-clip_frames  : 24      # 1 second at 24fps
-num_workers  : 4       # 0 for Windows, 4 for Linux/A100
+total_iters  : 1000
+batch_size   : 1          # T4 12GB — MUST be 1
+clip_frames  : 6          # reduced from 24 — saves ~4× attention memory
+num_workers  : 2          # Colab can handle 2
 lr           : 0.0001
-save_every   : 1000
-log_every    : 50
- 
+save_every   : 100
+log_every    : 1
+
 # ── PhD Loss weights (from paper) ──────────────────────────────────────────
 lambda_pose   : 0.1
 lambda_detail : 0.1
 lambda_low    : 0.1
+
+# ── Memory optimizations (critical for T4 12GB) ───────────────────────────
+aux_loss_prob      : 0.25     # only compute PhD auxiliary loss 25% of iters
+warmup_no_aux      : 500      # first 500 iters: MSE only, no VAE decode
 
 #python training/train.py --config training/config.yaml

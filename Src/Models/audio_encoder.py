@@ -9,6 +9,7 @@ Input:
 
 Output:
   embeddings   : (B, T_frames, output_dim)  -- frame-aligned, ready for xattn
+                 Default output_dim=1920 matches CogVideoX-2B inner_dim.
 """
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ class AudioEncoder(nn.Module):
 
     def __init__(
         self,
-        output_dim    : int  = 3072,
+        output_dim    : int  = 1920,   # CogVideoX-2B inner_dim (was 3072 for 5B)
         freeze_encoder: bool = True,
         model_name    : str  = "facebook/wav2vec2-base",
     ):

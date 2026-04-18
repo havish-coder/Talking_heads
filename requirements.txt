@@ -1,18 +1,29 @@
-onnxruntime-gpu==1.13.1
-matplotlib==3.6.2
-opencv-python==4.7.0.68
-scipy==1.11.4
-scikit-image==0.19.3
-huggingface-hub==0.20.1
-dwpose
-torch
-numpy
-pillow
-tqdm
-moviepy
-lpips
-librosa
-diffusers
-transformers
-peft
-pyyaml
+diffusers==0.32.2
+transformers==4.44.2
+accelerate==0.33.0
+peft==0.12.0
+safetensors==0.4.4
+huggingface-hub==0.24.6
+
+# ── Audio ─────────────────────────────────────────────────
+librosa==0.10.2
+soundfile==0.12.1
+
+# ── Perceptual Loss ────────────────────────────────────────
+lpips==0.1.4
+
+# ── Vision / Video ─────────────────────────────────────────
+opencv-python==4.10.0.84
+imageio==2.34.2
+imageio-ffmpeg==0.5.1
+Pillow==10.4.0
+
+# ── Scientific ─────────────────────────────────────────────
+numpy==1.26.4
+scipy==1.13.1
+scikit-image==0.24.0
+
+# ── Utilities ─────────────────────────────────────────────
+tqdm==4.66.4
+pyyaml==6.0.2
+matplotlib==3.9.1

@@ -20,6 +20,11 @@ Llow    : LPIPS perceptual loss between predicted and target RGB frame
 All three auxiliary losses use the SAME one-step decode — computed once,
 reused across whichever phase is active. VAE decode is done in fp32,
 no grad (frozen VAE).
+
+Memory optimization (T4 12GB):
+  - VAE is CPU-offloaded; moved to GPU only for decode, then back.
+  - LPIPS is kept on the compute device (small ~0.1 GB).
+  - Auxiliary loss is only computed ~25% of iterations (controlled by train.py).
 """
 
 from __future__ import annotations
@@ -70,10 +75,14 @@ def one_step_decode(
     timestep    : torch.Tensor,
     scheduler,
     vae,
+    vae_device  : torch.device | None = None,
 ) -> torch.Tensor:
     """
     One-step sampling: reconstruct clean latent from noisy latent + noise_pred,
     then VAE-decode to RGB.
+
+    Memory-optimized: if vae_device is provided, moves VAE to GPU for decode
+    then back to CPU immediately.
 
     Args:
         pred_latent  : not used directly, kept for API clarity
@@ -82,6 +91,7 @@ def one_step_decode(
         timestep     : (B,) — current diffusion timestep
         scheduler    : DDPMScheduler or similar — has step() method
         vae          : CogVideoX VAE — frozen, used only for decode
+        vae_device   : if set, move VAE to this device for decode, then back to CPU
 
     Returns:
         rgb : (B, 3, H*8, W*8) — decoded RGB frame (middle frame of clip)
@@ -99,13 +109,22 @@ def one_step_decode(
         mid = T // 2
         z0_frame = z0_pred[:, :, mid:mid+1, :, :]   # (B, 16, 1, H, W)
 
-        # VAE decode: (B, 16, 1, H, W) → (B, 3, H*8, W*8)
-        z0_frame = z0_frame.float()
+        # Move VAE to GPU for decode if offloaded
+        if vae_device is not None:
+            vae.to(vae_device)
+
+        # VAE decode: (B, 16, 1, H, W) → (B, 3, 1, H*8, W*8)
+        z0_frame = z0_frame.float().to(next(vae.parameters()).device)
         rgb = vae.decode(z0_frame).sample         # (B, 3, 1, H*8, W*8)
         rgb = rgb.squeeze(2)                      # (B, 3, H*8, W*8)
         rgb = rgb.clamp(-1.0, 1.0)
 
-    return rgb
+        # Move VAE back to CPU to free VRAM
+        if vae_device is not None:
+            vae.to("cpu")
+            torch.cuda.empty_cache()
+
+    return rgb.to(timestep.device)
 
 
 # ── PhD Loss ───────────────────────────────────────────────────────────────
@@ -156,6 +175,7 @@ class PhDLoss(nn.Module):
         target_rgb   : torch.Tensor,
         scheduler,
         vae,
+        vae_device   : torch.device | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """
         Compute PhD Loss for a batch.
@@ -170,7 +190,8 @@ class PhDLoss(nn.Module):
             timestep     : scalar tensor — same t for whole batch
             target_rgb   : (B, 3, H*8, W*8) — target RGB (middle frame, decoded)
             scheduler    : diffusion scheduler
-            vae          : frozen CogVideoX VAE
+            vae          : frozen CogVideoX VAE (may be on CPU)
+            vae_device   : GPU device to move VAE to for decode (then back to CPU)
 
         Returns:
             total_loss : scalar tensor
@@ -185,13 +206,14 @@ class PhDLoss(nn.Module):
         log_dict = {"Llatent": Llatent.item(), "phase": phase, "t": t_val}
 
         # ── Auxiliary loss: phase-dependent ───────────────────────────────
+        # One-step decode of predicted frame (moves VAE to GPU temporarily)
+        pred_rgb = one_step_decode(
+            None, noisy_latent, noise_pred, timestep, scheduler, vae,
+            vae_device=vae_device,
+        ).to(device)
+
         if phase == "S1":
-            # Lpose: MSE on Sobel edge maps (used as pose proxy — no pose extractor needed)
-            # Full Lpose from paper needs DWPose decode which is expensive at train time.
-            # We use differentiable Sobel as a proxy — captures body contours.
-            pred_rgb = one_step_decode(
-                None, noisy_latent, noise_pred, timestep, scheduler, vae
-            ).to(device)
+            # Lpose: MSE on Sobel edge maps (pose proxy — captures body contours)
             pred_edges   = sobel_edges(pred_rgb)
             target_edges = sobel_edges(target_rgb.to(device))
             Lpose = F.mse_loss(pred_edges, target_edges)
@@ -200,9 +222,6 @@ class PhDLoss(nn.Module):
 
         elif phase == "S2":
             # Ldetail: MSE on Canny edges (Sobel only, paper Section 3.5)
-            pred_rgb = one_step_decode(
-                None, noisy_latent, noise_pred, timestep, scheduler, vae
-            ).to(device)
             pred_edges   = sobel_edges(pred_rgb)
             target_edges = sobel_edges(target_rgb.to(device))
             Ldetail = F.mse_loss(pred_edges, target_edges)
@@ -211,13 +230,13 @@ class PhDLoss(nn.Module):
 
         else:
             # S3 — Llow: LPIPS perceptual loss
-            pred_rgb = one_step_decode(
-                None, noisy_latent, noise_pred, timestep, scheduler, vae
-            ).to(device)
             self.lpips_fn = self.lpips_fn.to(device)
             Llow = self.lpips_fn(pred_rgb.float(), target_rgb.to(device).float()).mean()
             total_loss = Llatent + self.lambda_low * Llow
             log_dict["Llow"] = Llow.item()
+
+        # Free the decoded RGB immediately
+        del pred_rgb
 
         log_dict["total_loss"] = total_loss.item()
         return total_loss, log_dict
@@ -248,6 +267,10 @@ if __name__ == "__main__":
             class Out:
                 sample = torch.randn(z.shape[0], 3, z.shape[2], z.shape[3]*8, z.shape[4]*8)
             return Out()
+        def parameters(self):
+            return iter([torch.zeros(1)])
+        def to(self, *args, **kwargs):
+            return self
 
     scheduler = MockScheduler()
     vae       = MockVAE()
