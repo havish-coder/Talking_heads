@@ -9,13 +9,13 @@ output_dir       : "../checkpoints"
 resume_from      : null
 
 # ── Training ───────────────────────────────────────────────────────────────
-total_iters  : 1000
+total_iters  : 35000
 batch_size   : 1          # T4 12GB — MUST be 1
 clip_frames  : 6          # reduced from 24 — saves ~4× attention memory
 num_workers  : 2          # Colab can handle 2
 lr           : 0.0001
-save_every   : 100
-log_every    : 1
+save_every   : 5000
+log_every    : 1000
 
 # ── PhD Loss weights (from paper) ──────────────────────────────────────────
 lambda_pose   : 0.1
@@ -23,7 +23,7 @@ lambda_detail : 0.1
 lambda_low    : 0.1
 
 # ── Memory optimizations (critical for T4 12GB) ───────────────────────────
-aux_loss_prob      : 0.25     # only compute PhD auxiliary loss 25% of iters
-warmup_no_aux      : 500      # first 500 iters: MSE only, no VAE decode
+aux_loss_prob      : 1     # only compute PhD auxiliary loss 25% of iters
+warmup_no_aux      : 5000   # first 500 iters: MSE only, no VAE decode
 
 #python training/train.py --config training/config.yaml

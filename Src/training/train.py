@@ -55,12 +55,13 @@ from training.loss import PhDLoss
 
 APDH_SCHEDULE = [
     # (start_iter, end_iter, stage, iterative_prob, unfreeze_n_layers)
-    # CogVideoX-2B has 30 transformer blocks
-    (0, 250, 1, 0.00, 0),
-    (250, 500, 2, 0.05, 4),
-    (500, 1000, 3, 0.10, 8),
-    (1000, 1500, 4, 0.20, 15),
-    (1500, 999999, 4, 0.20, 30),  # full fine-tune (all 30 blocks)
+
+    (5000, 12500, 2, 0.05, 4),
+    (12500, 20000, 3, 0.10, 8),
+    (20000, 27500, 4, 0.20, 15),
+    (27500, 35000, 4, 0.20, 30),
+    (35000, 99999, 4, 0.20, 30),
+     
 ]
 
 
