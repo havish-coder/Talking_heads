@@ -81,10 +81,9 @@ def build_audio_encoder_with_lora(model_name: str = "facebook/wav2vec2-base") ->
     Output dim = 1920 to match CogVideoX-2B inner_dim.
     """
     encoder = AudioEncoder(
-        output_dim=1920,           # CogVideoX-2B inner_dim
-        load_wav2vec2=True,        # Must be True to load backbone!
-        freeze_encoder=True,       # freeze everything first
-        model_name=model_name,
+        output_dim     = 1920,      # CogVideoX-2B inner_dim
+        freeze_encoder = True,      # freeze everything first
+        model_name     = model_name,
     )
 
     # Apply LoRA only to last transformer block's attention projections
@@ -190,7 +189,7 @@ def train(cfg: dict):
     print(f"[TRAIN] Device: {device} | dtype: {dtype}")
     if device.type == "cuda":
         print(f"[TRAIN] GPU: {torch.cuda.get_device_name(0)}")
-        print(f"[TRAIN] VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB\n")
+        print(f"[TRAIN] VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB\n")
 
     # ── 1. Models ──────────────────────────────────────────────────────────
     print("[TRAIN] Loading TalkingHeadsDiT (CogVideoX-2B)...")

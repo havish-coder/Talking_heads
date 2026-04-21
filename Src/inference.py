@@ -42,6 +42,7 @@ import os
 import sys
 import argparse
 from pathlib import Path
+import math
 
 import numpy as np
 import torch
@@ -142,24 +143,19 @@ def encode_reference_image(
     return latent.to(dtype)
 
 
-def load_audio_waveform(audio_path: str, clip_frames: int) -> torch.Tensor:
+def load_full_audio(audio_path: str) -> tuple[torch.Tensor, int]:
     """
-    Load and trim/pad audio to exactly `clip_frames` video frames at 16 kHz.
-
-    Returns : (T_audio,) float32 tensor, where T_audio = clip_frames * (16000/24)
+    Load full audio at 16 kHz and calculate the total video frames it corresponds to.
+    Returns: (waveform_tensor, total_frames)
     """
     waveform, _ = librosa.load(audio_path, sr=AUDIO_SR, mono=True)
-    samples_needed = int(clip_frames * AUDIO_SR / VIDEO_FPS)
-    if len(waveform) < samples_needed:
-        waveform = np.pad(waveform, (0, samples_needed - len(waveform)))
-    else:
-        waveform = waveform[:samples_needed]
-    return torch.from_numpy(waveform).float()
+    total_frames = math.ceil(len(waveform) / AUDIO_SR * VIDEO_FPS)
+    return torch.from_numpy(waveform).float(), total_frames
 
 
 def load_pose_keypoints(
     pose_path: str | None,
-    clip_frames: int,
+    total_frames: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor | None:
@@ -172,13 +168,13 @@ def load_pose_keypoints(
 
     pose_data = np.load(pose_path, allow_pickle=True)
     kp_frames = []
-    for frame_dict in pose_data[:clip_frames]:
+    for frame_dict in pose_data[:total_frames]:
         kp = frame_dict.get("keypoints", None)
         if kp is None or len(kp) == 0:
             kp = np.zeros((133, 2), dtype=np.float32)
         kp_frames.append(kp.astype(np.float32))
 
-    while len(kp_frames) < clip_frames:
+    while len(kp_frames) < total_frames:
         kp_frames.append(np.zeros((133, 2), dtype=np.float32))
 
     keypoints = torch.from_numpy(np.stack(kp_frames))    # (T, 133, 2)
@@ -282,19 +278,19 @@ def ddim_sample(
             else:
                 noise_pred = noise_pred_cond
 
-        # DDIM step — scheduler expects (B, C, T, H, W) — already in that form
-        # DDIMScheduler.step works on a flat "sample" tensor
-        noise_pred_flat = noise_pred.reshape(1, -1, LATENT_H, LATENT_W)  # squeeze T into B
-        # Correct approach: process frame-by-frame for the scheduler
-        new_latents = []
-        for fidx in range(clip_frames):
-            step_out = scheduler.step(
-                noise_pred[:, :, fidx],       # (1, 16, H, W)
-                t,
-                latents[:, :, fidx],          # (1, 16, H, W)
-            )
-            new_latents.append(step_out.prev_sample)
-        latents = torch.stack(new_latents, dim=2)   # (1, 16, T, H, W)
+        # Process all frames at once by treating Time as the Batch dimension
+        # This prevents internal _step_index corruption in diffusers schedulers!
+        noise_pred_batched = noise_pred.squeeze(0).transpose(0, 1)  # (T, 16, H, W)
+        latents_batched = latents.squeeze(0).transpose(0, 1)        # (T, 16, H, W)
+        
+        step_out = scheduler.step(
+            noise_pred_batched,
+            t,
+            latents_batched,
+        )
+        
+        # Reshape back to (1, 16, T, H, W)
+        latents = step_out.prev_sample.transpose(0, 1).unsqueeze(0)
 
     return latents
 
@@ -323,8 +319,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg_scale",   type=float, default=3.5,
                         help="Classifier-free guidance scale (default: 3.5). "
                              "Set to 1.0 to disable.")
-    parser.add_argument("--clip_frames", type=int, default=CLIP_FRAMES,
-                        help="Number of latent frames to generate (default: 24 = 1 s).")
+    parser.add_argument("--chunk_size",  type=int, default=CLIP_FRAMES,
+                        help="Max frames to generate per chunk to save VRAM (default: 24). Total length is auto-determined by audio.")
     parser.add_argument("--seed",        type=int, default=42,
                         help="Random seed (default: 42).")
     parser.add_argument("--pretrained_model", type=str, default=PRETRAINED_MODEL,
@@ -338,8 +334,8 @@ def main():
     args = parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # T4 supports fp16 natively, NOT bf16 (bf16 is emulated = slow)
-    dtype  = torch.float16 if device.type == "cuda" else torch.float32
+    # H100 supports bfloat16 natively and prevents the NaN/static noise overflows common in fp16
+    dtype  = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"\n[INFERENCE] Device: {device} | dtype: {dtype}\n")
 
     # ── 1. Load models ─────────────────────────────────────────────────────
@@ -374,55 +370,92 @@ def main():
     audio_enc.eval()
 
     # ── 3. Encode inputs ───────────────────────────────────────────────────
-    print(f"\n[INFERENCE] Encoding reference image: {args.ref_image}")
-    ref_latents = encode_reference_image(args.ref_image, vae, device, dtype)
-    print(f"  ref_latents  : {tuple(ref_latents.shape)}")
-
-    print(f"\n[INFERENCE] Loading audio: {args.audio}")
-    waveform = load_audio_waveform(args.audio, args.clip_frames).to(device)
-    print(f"  waveform     : {tuple(waveform.shape)}")
-
-    print("\n[INFERENCE] Encoding audio with AudioEncoder...")
-    with torch.no_grad():
-        with torch.autocast(device_type=device.type, dtype=dtype,
-                            enabled=(device.type == "cuda")):
-            audio_embeds = audio_enc(
-                waveform.unsqueeze(0).float(),  # (1, T_audio)
-                target_frames=args.clip_frames,
-            )
-    print(f"  audio_embeds : {tuple(audio_embeds.shape)}")
+    print(f"\n[INFERENCE] Loading full audio: {args.audio}")
+    waveform, total_frames = load_full_audio(args.audio)
+    print(f"  Total frames to generate based on audio length: {total_frames}")
 
     pose_keypoints = None
     if args.pose:
         print(f"\n[INFERENCE] Loading pose keypoints: {args.pose}")
         pose_keypoints = load_pose_keypoints(
-            args.pose, args.clip_frames, device, dtype
+            args.pose, total_frames, device, dtype
         )
         print(f"  pose_keypoints : {tuple(pose_keypoints.shape)}")
     else:
         print("\n[INFERENCE] No pose file provided — running audio-only mode.")
 
-    # ── 4. DDIM sampling ───────────────────────────────────────────────────
-    print(f"\n[INFERENCE] Running DDIM sampling ({args.steps} steps, cfg={args.cfg_scale})...")
-    video_latents = ddim_sample(
-        dit            = dit,
-        scheduler      = scheduler,
-        ref_latents    = ref_latents,
-        audio_embeds   = audio_embeds,
-        pose_keypoints = pose_keypoints,
-        clip_frames    = args.clip_frames,
-        device         = device,
-        dtype          = dtype,
-        num_steps      = args.steps,
-        cfg_scale      = args.cfg_scale,
-        seed           = args.seed,
-    )
-    print(f"  video_latents : {tuple(video_latents.shape)}")
+    print(f"\n[INFERENCE] Encoding reference image: {args.ref_image}")
+    current_ref_latents = encode_reference_image(args.ref_image, vae, device, dtype)
+    print(f"  ref_latents  : {tuple(current_ref_latents.shape)}")
+
+    # ── 4. Autoregressive Chunking & DDIM sampling ─────────────────────────
+    all_video_latents = []
+    
+    print(f"\n[INFERENCE] Running Autoregressive Chunking ({args.steps} steps, cfg={args.cfg_scale})...")
+    for start_frame in range(0, total_frames, args.chunk_size):
+        end_frame = min(start_frame + args.chunk_size, total_frames)
+        chunk_frames = end_frame - start_frame
+        
+        print(f"\n  => Generating chunk: frames {start_frame} to {end_frame} ({chunk_frames} frames)...")
+        
+        # 4a. Extract corresponding audio chunk
+        start_sample = int(start_frame * AUDIO_SR / VIDEO_FPS)
+        end_sample = int(end_frame * AUDIO_SR / VIDEO_FPS)
+        audio_chunk = waveform[start_sample:end_sample]
+        
+        expected_samples = int(chunk_frames * AUDIO_SR / VIDEO_FPS)
+        if len(audio_chunk) < expected_samples:
+            pad_len = expected_samples - len(audio_chunk)
+            audio_chunk = torch.nn.functional.pad(audio_chunk, (0, pad_len))
+            
+        audio_chunk = audio_chunk.to(device)
+        
+        print("     Encoding audio chunk...")
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                audio_embeds = audio_enc(
+                    audio_chunk.unsqueeze(0).float(),
+                    target_frames=chunk_frames,
+                )
+                
+        # 4b. Extract corresponding pose chunk
+        pose_chunk = None
+        if pose_keypoints is None:
+            pose_chunk = None
+        else:
+            pose_chunk = pose_keypoints[:, start_frame:end_frame, :, :]
+            
+        # 4c. Generate DDIM latents
+        chunk_latents = ddim_sample(
+            dit            = dit,
+            scheduler      = scheduler,
+            ref_latents    = current_ref_latents,
+            audio_embeds   = audio_embeds,
+            pose_keypoints = pose_chunk,
+            clip_frames    = chunk_frames,
+            device         = device,
+            dtype          = dtype,
+            num_steps      = args.steps,
+            cfg_scale      = args.cfg_scale,
+            seed           = args.seed + start_frame,
+        )
+        
+        # Move latents to CPU to save GPU VRAM
+        all_video_latents.append(chunk_latents.cpu())
+        
+        # 4d. The last frame of this chunk becomes the reference image for the next chunk!
+        current_ref_latents = chunk_latents[:, :, -1:, :, :]
 
     # ── 5. Decode to RGB frames ────────────────────────────────────────────
-    print("\n[INFERENCE] Decoding latents to RGB frames...")
-    frames = decode_latents_to_frames(video_latents, vae)
-    print(f"  Decoded {len(frames)} frame(s), each {frames[0].shape}")
+    print("\n[INFERENCE] Decoding all latents to RGB frames...")
+    frames = []
+    for chunk_latents in all_video_latents:
+        # Move back to GPU chunk-by-chunk for decoding
+        chunk_latents = chunk_latents.to(device)
+        chunk_frames_rgb = decode_latents_to_frames(chunk_latents, vae)
+        frames.extend(chunk_frames_rgb)
+        
+    print(f"  Decoded {len(frames)} total frame(s)")
 
     # ── 6. Write video ─────────────────────────────────────────────────────
     out_path = Path(args.output)
