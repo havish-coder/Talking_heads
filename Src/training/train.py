@@ -37,6 +37,7 @@ import argparse
 import yaml
 import random
 from pathlib import Path
+from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
@@ -55,13 +56,12 @@ from training.loss import PhDLoss
 
 APDH_SCHEDULE = [
     # (start_iter, end_iter, stage, iterative_prob, unfreeze_n_layers)
-
-    (5000, 12500, 2, 0.05, 4),
-    (12500, 20000, 3, 0.10, 8),
-    (20000, 27500, 4, 0.20, 15),
-    (27500, 35000, 4, 0.20, 30),
-    (35000, 99999, 4, 0.20, 30),
-     
+    (0, 50, 1, 0.0, 0),
+    (50, 1500, 2, 0.05, 4),
+    (1500, 3000, 3, 0.10, 8),
+    (3000, 4200, 4, 0.20, 15),
+    (4200, 5400, 4, 0.20, 30),
+    (5400, 99999, 4, 0.20, 30),
 ]
 
 
@@ -152,32 +152,19 @@ def load_checkpoint(
     return iteration
 
 
-# ── VAE decode helper with GPU offload ─────────────────────────────────────
-
 def vae_decode_frame(
     latent: torch.Tensor,
     vae: AutoencoderKLCogVideoX,
     device: torch.device,
 ) -> torch.Tensor:
     """
-    Decode a single frame latent to RGB, moving VAE to GPU temporarily.
-
-    Args:
-        latent : (B, 16, 1, H, W) — single frame latent
-        vae    : frozen VAE on CPU
-        device : target GPU device
-
-    Returns:
-        rgb : (B, 3, H*8, W*8) — decoded RGB in [-1, 1]
+    Decode a single frame latent to RGB.
     """
-    vae.to(device)
     with torch.no_grad():
         rgb = vae.decode(latent.to(device).float()).sample
         if rgb.dim() == 5:
             rgb = rgb.squeeze(2)
         rgb = rgb.clamp(-1.0, 1.0)
-    vae.to("cpu")
-    torch.cuda.empty_cache()
     return rgb
 
 
@@ -185,8 +172,8 @@ def vae_decode_frame(
 
 def train(cfg: dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # T4 natively supports fp16 but NOT bf16 (bf16 is emulated = slow + broken)
-    dtype  = torch.float16 if device.type == "cuda" else torch.float32
+    # Upgraded to bfloat16 for A100/H100 stability
+    dtype  = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     print(f"[TRAIN] Device: {device} | dtype: {dtype}")
     if device.type == "cuda":
         print(f"[TRAIN] GPU: {torch.cuda.get_device_name(0)}")
@@ -212,11 +199,11 @@ def train(cfg: dict):
     print("\n[TRAIN] Loading AudioEncoder with LoRA...")
     audio_enc = build_audio_encoder_with_lora(cfg["wav2vec2_model"]).to(device)
 
-    # ── VAE: stays on CPU, moved to GPU only for PhD aux loss decode ──────
-    print("\n[TRAIN] Loading VAE (frozen, CPU-offloaded to save ~0.8 GB VRAM)...")
+    # ── VAE: stays on GPU for max speed on H200 ──────
+    print("\n[TRAIN] Loading VAE (frozen, placed directly on GPU)...")
     vae = AutoencoderKLCogVideoX.from_pretrained(
         cfg["pretrained_model"], subfolder="vae", torch_dtype=torch.float32
-    )  # intentionally NOT .to(device) — stays on CPU
+    ).to(device)
     vae.requires_grad_(False)
     vae.eval()
 
@@ -232,7 +219,21 @@ def train(cfg: dict):
         lambda_low    = cfg.get("lambda_low",    0.1),
     ).to(device)
 
-    # ── 3. Optimizer ───────────────────────────────────────────────────────
+    # ── 3. Resume Setup & Pre-Unfreeze (FIXED) ─────────────────────────────
+    start_iter = 0
+    current_stage = -1
+
+    if cfg.get("resume_from"):
+        # Temporarily peek at the checkpoint to know our starting iteration
+        ckpt_tmp = torch.load(cfg["resume_from"], map_location="cpu")
+        start_iter = ckpt_tmp["iteration"]
+        del ckpt_tmp
+        
+        # Pre-unfreeze the model so the optimizer matches the checkpoint
+        current_stage, iterative_prob, n_layers = get_apdh_stage(start_iter)
+        dit.unfreeze_backbone_top_n_layers(n_layers)
+
+    # ── 4. Optimizer ───────────────────────────────────────────────────────
     trainable_params = (
         [p for p in dit.parameters()       if p.requires_grad] +
         [p for p in audio_enc.parameters() if p.requires_grad]
@@ -250,24 +251,20 @@ def train(cfg: dict):
         betas        = (0.9, 0.999),
         weight_decay = 1e-2,
     )
-    # GradScaler for fp16 — essential for stable training on T4
     scaler = GradScaler(enabled=(dtype == torch.float16))
 
-    # ── 4. DataLoader ──────────────────────────────────────────────────────
+    # ── 5. DataLoader & Checkpoint Load ────────────────────────────────────
     dataset, loader = get_dataloader(
         root_dir    = cfg["data_root"],
         batch_size  = cfg.get("batch_size", 1),
         clip_frames = cfg.get("clip_frames", 6),
         num_workers = cfg.get("num_workers", 2),
-        apdh_stage  = 1,
+        apdh_stage  = 1 if current_stage == -1 else current_stage,
     )
 
-    # ── 5. Resume ──────────────────────────────────────────────────────────
-    start_iter = 0
     if cfg.get("resume_from"):
-        start_iter = load_checkpoint(
-            cfg["resume_from"], dit, audio_enc, optimizer, scaler
-        )
+        # Now that the optimizer has the right layers, load the states!
+        load_checkpoint(cfg["resume_from"], dit, audio_enc, optimizer, scaler)
 
     # ── 6. Memory optimization config ─────────────────────────────────────
     aux_loss_prob  = cfg.get("aux_loss_prob", 0.25)      # compute PhD aux 25% of iters
@@ -278,7 +275,6 @@ def train(cfg: dict):
     save_every     = cfg.get("save_every",  500)
     log_every      = cfg.get("log_every",   25)
     output_dir     = cfg.get("output_dir",  "checkpoints")
-    current_stage  = -1
 
     dit.train()
     audio_enc.train()
@@ -291,7 +287,8 @@ def train(cfg: dict):
         print(f"[MEM] Peak allocated: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB\n")
         torch.cuda.reset_peak_memory_stats()
 
-    for iteration in range(start_iter, total_iters):
+    pbar = tqdm(range(start_iter, total_iters), initial=start_iter, total=total_iters, desc="Training")
+    for iteration in pbar:
 
         # ── APDH curriculum check ──────────────────────────────────────────
         stage, iterative_prob, n_layers = get_apdh_stage(iteration)
@@ -315,7 +312,7 @@ def train(cfg: dict):
                 betas=(0.9, 0.999),
                 weight_decay=1e-2,
             )
-            print(f"\n[APDH] → Stage {stage} | "
+            tqdm.write(f"\n[APDH] → Stage {stage} | "
                   f"trainable: {sum(p.numel() for p in trainable_params):,}")
 
         # ── Get batch ─────────────────────────────────────────────────────
@@ -337,7 +334,7 @@ def train(cfg: dict):
         with torch.no_grad():
             # Run Wav2Vec2 in FP32 (it frequently produces NaNs in FP16 autocast)
             audio_embeds = audio_enc(audio_waveform.float(), target_frames=T).detach()
-            # Cast the embeddings to match the DiT's dtype (FP16)
+            # Cast the embeddings to match the DiT's dtype (FP16/BF16)
             audio_embeds = audio_embeds.to(dtype)
         del audio_waveform  # free immediately
 
@@ -369,10 +366,10 @@ def train(cfg: dict):
         )
 
         if use_aux:
-            # Full PhD loss — requires VAE decode (temporarily move VAE to GPU)
+            # Full PhD loss — requires VAE decode
             mid = T // 2
             z_target = video_latents[:, :, mid:mid+1, :, :].detach()
-            target_rgb = vae_decode_frame(z_target, vae, device)  # moves VAE to GPU and back
+            target_rgb = vae_decode_frame(z_target, vae, device)
             del z_target
 
             total_loss, log_dict = loss_fn(
@@ -383,7 +380,7 @@ def train(cfg: dict):
                 target_rgb   = target_rgb,
                 scheduler    = scheduler,
                 vae          = vae,
-                vae_device   = device,
+                vae_device   = None,  # VAE stays on GPU
             )
             del target_rgb
         else:
@@ -411,13 +408,19 @@ def train(cfg: dict):
         torch.cuda.empty_cache()
 
         # ── Logging ───────────────────────────────────────────────────────
+        pbar.set_postfix({
+            "stage": stage,
+            "loss": f"{log_dict['total_loss']:.4f}",
+            "phase": log_dict['phase']
+        })
+
         if iteration % log_every == 0:
             elapsed = time.time() - t0
             iters_per_sec = log_every / max(elapsed, 1e-6)
             t0 = time.time()
             mem_gb = torch.cuda.memory_reserved() / 1e9 if device.type == "cuda" else 0.0
             peak_gb = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
-            print(
+            tqdm.write(
                 f"[{iteration:06d}] "
                 f"stage={stage} | "
                 f"phase={log_dict['phase']} | "

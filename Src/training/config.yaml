@@ -4,18 +4,18 @@
 # ── Paths ──────────────────────────────────────────────────────────────────
 pretrained_model : "THUDM/CogVideoX-2b"
 wav2vec2_model   : "facebook/wav2vec2-base"
-data_root        : ".../DATASET"
+data_root        : "/teamspace/studios/this_studio/Talking_heads/DATASET"
 output_dir       : "../checkpoints"
 resume_from      : null
 
 # ── Training ───────────────────────────────────────────────────────────────
-total_iters  : 35000
-batch_size   : 1          # T4 12GB — MUST be 1
-clip_frames  : 6          # reduced from 24 — saves ~4× attention memory
+total_iters  : 5400
+batch_size   : 2         # H200 can easily handle 4+
+clip_frames  : 6        # Restored to 24 (1 full second) for better temporal learning
 num_workers  : 2          # Colab can handle 2
-lr           : 0.0001
-save_every   : 5000
-log_every    : 1000
+lr           : 0.0005
+save_every   : 500
+log_every    : 50
 
 # ── PhD Loss weights (from paper) ──────────────────────────────────────────
 lambda_pose   : 0.1
@@ -24,6 +24,6 @@ lambda_low    : 0.1
 
 # ── Memory optimizations (critical for T4 12GB) ───────────────────────────
 aux_loss_prob      : 1     # only compute PhD auxiliary loss 25% of iters
-warmup_no_aux      : 5000   # first 500 iters: MSE only, no VAE decode
+warmup_no_aux      : 50   # first 3000 iters: MSE only, no VAE decode
 
 #python training/train.py --config training/config.yaml
