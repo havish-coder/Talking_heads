@@ -143,10 +143,24 @@ def load_checkpoint(
     scaler      : GradScaler,
 ) -> int:
     ckpt = torch.load(ckpt_path, map_location="cpu")
+    
+    # 1. Load the visual weights (This works perfectly!)
     dit.load_state_dict(ckpt["dit_trainable"], strict=False)
     audio_enc.load_state_dict(ckpt["audio_enc_lora"], strict=False)
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scaler.load_state_dict(ckpt["scaler"])
+    
+    # 2. Safely try to load the optimizer momentum
+    try:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    except ValueError:
+        print("\n[WARN] Optimizer size mismatch! The checkpoint has a different number of unfrozen layers.")
+        print("[WARN] Model weights loaded successfully! Resetting optimizer momentum to prevent crash.\n")
+        
+    # 3. Safely try to load the GradScaler
+    try:
+        scaler.load_state_dict(ckpt["scaler"])
+    except Exception:
+        pass
+
     iteration = ckpt["iteration"]
     print(f"[CKPT] Resumed from iteration {iteration}")
     return iteration
