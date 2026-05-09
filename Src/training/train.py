@@ -1,61 +1,63 @@
 """
 training/train.py
 
-Main training loop for Talking_Heads — optimized for T4 12GB Colab.
+Main training loop for the TalkingHeadsDiT model — heavily optimized for T4 (12GB) / Colab environments.
 
-Memory optimizations applied:
-  - fp16 mixed precision (T4 native, NOT bf16 which T4 emulates slowly)
-  - batch_size=1, clip_frames=6
-  - VAE offloaded to CPU, moved to GPU only for PhD auxiliary loss decode
-  - Audio tokens per frame reduced 4→1 (4× less cross-attention memory)
-  - PhD auxiliary loss computed only 25% of iterations (saves ~4 GB/iter)
-  - Aggressive intermediate tensor cleanup
-  - Gradient checkpointing on backbone
+Memory Optimizations Applied:
+  - Mixed Precision       : fp16/bf16 native support.
+  - Batching              : batch_size=1, clip_frames=6.
+  - VAE Offloading        : VAE is kept on CPU/GPU conditionally; moved to GPU only for PhD auxiliary loss decoding.
+  - Audio Context         : Audio tokens per frame reduced from 4 to 1 (saves ~4x cross-attention memory).
+  - Sparse Aux Loss       : PhD auxiliary loss is computed on only ~25% of iterations (saves ~4 GB/iter).
+  - Memory Management     : Aggressive intermediate tensor cleanup (`del` + `empty_cache`).
+  - Checkpointing         : Gradient checkpointing enabled on the DiT backbone.
 
-APDH Stage Schedule:
-  Stage 1 :     0 – 10k iters  full pose,  audio frozen
-  Stage 2 : 10k – 20k iters  no lips,    audio → lips
-  Stage 3 : 20k – 30k iters  no head,    audio → face
-  Stage 4 : 30k – 40k iters  hands only, audio → global
+APDH Curriculum Schedule:
+  - Stage 1 (0-10k)       : Full pose, audio frozen.
+  - Stage 2 (10k-20k)     : No lips, audio mapped to lips.
+  - Stage 3 (20k-30k)     : No head, audio mapped to face.
+  - Stage 4 (30k-40k)     : Hands only, audio mapped globally.
 
-Run from Src/:
+Usage:
   python training/train.py --config training/config.yaml
 """
 
 from __future__ import annotations
 
+import argparse
 import gc
-import os
-import sys
 import inspect
+import os
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Tuple
+
+import torch
+import torch.nn.functional as F
+import yaml
+from diffusers import AutoencoderKLCogVideoX, DDPMScheduler
+from peft import LoraConfig, get_peft_model
+from torch.amp import GradScaler
+from tqdm import tqdm
+from transformers import Wav2Vec2Model
 
 # Disable Python bytecode caching to prevent Google Drive __pycache__ corruption
 sys.dont_write_bytecode = True
 
-import time
-import argparse
-import yaml
-import random
-from pathlib import Path
-from tqdm import tqdm
-
-import torch
-import torch.nn.functional as F
-from torch.amp import GradScaler
-from diffusers import AutoencoderKLCogVideoX, DDPMScheduler
-from transformers import Wav2Vec2Model
-from peft import LoraConfig, get_peft_model
+# Ensure local Models and training directories are importable
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
-from Models.talking_heads_dit import TalkingHeadsDiT
+
 from Models.audio_encoder import AudioEncoder
+from Models.talking_heads_dit import TalkingHeadsDiT
 from training.dataset import get_dataloader
 from training.loss import PhDLoss
 
+# --- APDH Curriculum Configurations ---
 
-# ── APDH Stage definitions ─────────────────────────────────────────────────
-
+# Format: (start_iter, end_iter, stage, iterative_prob, unfreeze_n_layers)
 APDH_SCHEDULE = [
-    # (start_iter, end_iter, stage, iterative_prob, unfreeze_n_layers)
     (0, 50, 1, 0.0, 0),
     (50, 1500, 2, 0.05, 4),
     (1500, 3000, 3, 0.10, 8),
@@ -65,29 +67,29 @@ APDH_SCHEDULE = [
 ]
 
 
-def get_apdh_stage(iteration: int) -> tuple[int, float, int]:
-    """Return (stage, iterative_prob, n_layers_to_unfreeze) for current iteration."""
+def get_apdh_stage(iteration: int) -> Tuple[int, float, int]:
+    """Retrieves the APDH curriculum parameters for the current training iteration."""
     for start, end, stage, prob, layers in APDH_SCHEDULE:
         if start <= iteration < end:
             return stage, prob, layers
-    return 4, 0.20, 30
+    return 4, 0.20, 30  # Default fallback
 
 
-# ── LoRA setup for Wav2Vec2 ────────────────────────────────────────────────
+# --- Audio Encoder & LoRA Setup ---
 
 def build_audio_encoder_with_lora(model_name: str = "facebook/wav2vec2-base") -> AudioEncoder:
     """
-    Build AudioEncoder with LoRA injected into last transformer block only.
-    Rank=4, Alpha=8 → ~50k trainable params instead of ~7M.
-    Output dim = 1920 to match CogVideoX-2B inner_dim.
+    Builds the AudioEncoder with LoRA injected strictly into the last transformer block.
+    Rank=4, Alpha=8 reduces trainable parameters from ~7M to ~50k.
+    Output dimension is mapped to 1920 to align with CogVideoX-2B's inner dimension.
     """
     encoder = AudioEncoder(
-        output_dim     = 1920,      # CogVideoX-2B inner_dim
-        freeze_encoder = True,      # freeze everything first
-        model_name     = model_name,
+        output_dim=1920,
+        freeze_encoder=True,
+        model_name=model_name,
     )
 
-    # Apply LoRA only to last transformer block's attention projections
+    # Apply LoRA exclusively to the final block's attention projections
     lora_config = LoraConfig(
         r=4,
         lora_alpha=8,
@@ -96,73 +98,77 @@ def build_audio_encoder_with_lora(model_name: str = "facebook/wav2vec2-base") ->
         bias="none",
     )
 
-    # Wrap only the last transformer layer
     last_layer = encoder.wav2vec2.encoder.layers[-1]
     encoder.wav2vec2.encoder.layers[-1] = get_peft_model(last_layer, lora_config)
 
-    print(f"[AudioEncoder] LoRA injected into last block.")
-    print(f"[AudioEncoder] Trainable params: "
-          f"{sum(p.numel() for p in encoder.parameters() if p.requires_grad):,}")
+    trainable_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+    print(f"[INFO] AudioEncoder initialized with LoRA. Trainable params: {trainable_params:,}")
     return encoder
 
 
-# ── Checkpoint helpers ─────────────────────────────────────────────────────
+# --- Checkpoint Management ---
 
 def save_checkpoint(
-    iteration   : int,
-    dit         : TalkingHeadsDiT,
-    audio_enc   : AudioEncoder,
-    optimizer   : torch.optim.Optimizer,
-    scaler      : GradScaler,
-    output_dir  : str,
-):
+    iteration: int,
+    dit: TalkingHeadsDiT,
+    audio_enc: AudioEncoder,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    output_dir: str,
+) -> None:
+    """Saves only the unfrozen/trainable weights to conserve storage."""
     ckpt_dir = Path(output_dir) / f"checkpoint_{iteration:06d}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save only trainable params — not the full frozen backbone
+    # Extract only the weights that require gradients or are explicitly managed
+    dit_trainable = {
+        k: v for k, v in dit.state_dict().items()
+        if dit.state_dict()[k].requires_grad
+        or k.startswith("audio_proj")
+        or k.startswith("pose_encoder")
+        or k.startswith("pose_scale")
+    }
+
     torch.save({
-        "iteration"         : iteration,
-        "dit_trainable"     : {k: v for k, v in dit.state_dict().items()
-                               if dit.state_dict()[k].requires_grad
-                               or k.startswith("audio_proj")
-                               or k.startswith("pose_encoder")
-                               or k.startswith("pose_scale")},
-        "audio_enc_lora"    : audio_enc.state_dict(),
-        "optimizer"         : optimizer.state_dict(),
-        "scaler"            : scaler.state_dict(),
+        "iteration": iteration,
+        "dit_trainable": dit_trainable,
+        "audio_enc_lora": audio_enc.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict(),
     }, ckpt_dir / "checkpoint.pt")
 
-    print(f"[CKPT] Saved → {ckpt_dir}")
+    print(f"[CKPT] Saved checkpoint -> {ckpt_dir}")
 
 
 def load_checkpoint(
-    ckpt_path   : str,
-    dit         : TalkingHeadsDiT,
-    audio_enc   : AudioEncoder,
-    optimizer   : torch.optim.Optimizer,
-    scaler      : GradScaler,
+    ckpt_path: str,
+    dit: TalkingHeadsDiT,
+    audio_enc: AudioEncoder,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
 ) -> int:
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    
-    # 1. Load the visual weights (This works perfectly!)
+    """Loads weights and safely restores optimizer states if layer counts match."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    # 1. Load Model Weights
     dit.load_state_dict(ckpt["dit_trainable"], strict=False)
     audio_enc.load_state_dict(ckpt["audio_enc_lora"], strict=False)
-    
-    # 2. Safely try to load the optimizer momentum
+
+    # 2. Safely Load Optimizer (Handles curriculum unfreezing mismatches)
     try:
         optimizer.load_state_dict(ckpt["optimizer"])
     except ValueError:
-        print("\n[WARN] Optimizer size mismatch! The checkpoint has a different number of unfrozen layers.")
-        print("[WARN] Model weights loaded successfully! Resetting optimizer momentum to prevent crash.\n")
-        
-    # 3. Safely try to load the GradScaler
+        print("\n[WARN] Optimizer size mismatch detected (due to curriculum unfreezing).")
+        print("[WARN] Model weights loaded successfully, but optimizer momentum is reset to prevent crashes.\n")
+
+    # 3. Safely Load GradScaler
     try:
         scaler.load_state_dict(ckpt["scaler"])
     except Exception:
-        pass
+        print("[WARN] Could not load GradScaler state. Resetting scaler.")
 
     iteration = ckpt["iteration"]
-    print(f"[CKPT] Resumed from iteration {iteration}")
+    print(f"[CKPT] Successfully resumed from iteration {iteration}")
     return iteration
 
 
@@ -171,9 +177,7 @@ def vae_decode_frame(
     vae: AutoencoderKLCogVideoX,
     device: torch.device,
 ) -> torch.Tensor:
-    """
-    Decode a single frame latent to RGB.
-    """
+    """Decodes a single frame latent to RGB space."""
     with torch.no_grad():
         rgb = vae.decode(latent.to(device).float()).sample
         if rgb.dim() == 5:
@@ -182,154 +186,140 @@ def vae_decode_frame(
     return rgb
 
 
-# ── Main training function ─────────────────────────────────────────────────
+# --- Main Training Routine ---
 
-def train(cfg: dict):
+def train(cfg: dict) -> None:
+    # --- 1. Environment & Hardware Setup ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Upgraded to bfloat16 for A100/H100 stability
-    dtype  = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    print(f"[TRAIN] Device: {device} | dtype: {dtype}")
+    # Upgrade to bfloat16 natively if supported (A100/H100), fallback to fp16 (T4)
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    
+    print(f"[SYSTEM] Hardware -> Device: {device} | Dtype: {dtype}")
     if device.type == "cuda":
-        print(f"[TRAIN] GPU: {torch.cuda.get_device_name(0)}")
-        print(f"[TRAIN] VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB\n")
+        print(f"[SYSTEM] GPU -> {torch.cuda.get_device_name(0)}")
+        print(f"[SYSTEM] VRAM -> {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB\n")
 
-    # ── 1. Models ──────────────────────────────────────────────────────────
-    print("[TRAIN] Loading TalkingHeadsDiT (CogVideoX-2B)...")
+    # --- 2. Model Initialization ---
+    print("[INFO] Loading TalkingHeadsDiT (CogVideoX-2B Backbone)...")
     dit = TalkingHeadsDiT.from_pretrained_cogvideox(
         cfg["pretrained_model"],
-        freeze_backbone        = True,
-        gradient_checkpointing = True,
-        audio_input_dim        = 1920,
-        audio_tokens_per_frame = 1,       # reduced from 4 — saves 4× attention memory
+        freeze_backbone=True,
+        gradient_checkpointing=True,
+        audio_input_dim=1920,
+        audio_tokens_per_frame=1,  # Critical memory save: reduced from 4 to 1
     ).to(device, dtype=dtype)
     print(dit.param_summary())
 
-    # Force cleanup after model loading
+    # Force VRAM cleanup after heavy model load
     gc.collect()
     torch.cuda.empty_cache()
     if device.type == "cuda":
-        print(f"[MEM] After DiT load: {torch.cuda.memory_reserved() / 1e9:.2f} GB reserved")
+        print(f"[MEM] VRAM Reserved after DiT load: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
-    print("\n[TRAIN] Loading AudioEncoder with LoRA...")
+    print("\n[INFO] Loading AudioEncoder & VAE...")
     audio_enc = build_audio_encoder_with_lora(cfg["wav2vec2_model"]).to(device)
 
-    # ── VAE: stays on GPU for max speed on H200 ──────
-    print("\n[TRAIN] Loading VAE (frozen, placed directly on GPU)...")
     vae = AutoencoderKLCogVideoX.from_pretrained(
         cfg["pretrained_model"], subfolder="vae", torch_dtype=torch.float32
     ).to(device)
     vae.requires_grad_(False)
     vae.eval()
 
-    print("\n[TRAIN] Loading scheduler...")
-    scheduler = DDPMScheduler.from_pretrained(
-        cfg["pretrained_model"], subfolder="scheduler"
-    )
+    scheduler = DDPMScheduler.from_pretrained(cfg["pretrained_model"], subfolder="scheduler")
 
-    # ── 2. Loss ────────────────────────────────────────────────────────────
     loss_fn = PhDLoss(
-        lambda_pose   = cfg.get("lambda_pose",   0.1),
-        lambda_detail = cfg.get("lambda_detail", 0.1),
-        lambda_low    = cfg.get("lambda_low",    0.1),
+        lambda_pose=cfg.get("lambda_pose", 0.1),
+        lambda_detail=cfg.get("lambda_detail", 0.1),
+        lambda_low=cfg.get("lambda_low", 0.1),
     ).to(device)
 
-    # ── 3. Resume Setup & Pre-Unfreeze (FIXED) ─────────────────────────────
+    # --- 3. Resume State & Curriculum Pre-Unfreeze ---
     start_iter = 0
     current_stage = -1
 
     if cfg.get("resume_from"):
-        # Temporarily peek at the checkpoint to know our starting iteration
-        ckpt_tmp = torch.load(cfg["resume_from"], map_location="cpu")
+        # Temporarily peek at checkpoint to align the curriculum stage before building optimizer
+        ckpt_tmp = torch.load(cfg["resume_from"], map_location="cpu", weights_only=False)
         start_iter = ckpt_tmp["iteration"]
         del ckpt_tmp
         
-        # Pre-unfreeze the model so the optimizer matches the checkpoint
         current_stage, iterative_prob, n_layers = get_apdh_stage(start_iter)
         dit.unfreeze_backbone_top_n_layers(n_layers)
 
-    # ── 4. Optimizer ───────────────────────────────────────────────────────
+    # --- 4. Optimizer Configurations ---
     trainable_params = (
-        [p for p in dit.parameters()       if p.requires_grad] +
+        [p for p in dit.parameters() if p.requires_grad] +
         [p for p in audio_enc.parameters() if p.requires_grad]
     )
     
-    # CRITICAL FIX: Force trainable parameters to float32 so GradScaler doesn't crash
+    # CRITICAL FIX: Force trainable parameters to fp32 to prevent GradScaler crashes
     for p in trainable_params:
         p.data = p.data.to(torch.float32)
 
-    print(f"\n[TRAIN] Total trainable params: {sum(p.numel() for p in trainable_params):,}")
+    print(f"\n[INFO] Total Trainable Parameters: {sum(p.numel() for p in trainable_params):,}")
 
     optimizer = torch.optim.AdamW(
         trainable_params,
-        lr           = cfg.get("lr", 1e-5),
-        betas        = (0.9, 0.999),
-        weight_decay = 1e-2,
+        lr=cfg.get("lr", 1e-5),
+        betas=(0.9, 0.999),
+        weight_decay=1e-2,
     )
     scaler = GradScaler(enabled=(dtype == torch.float16))
 
-    # ── 5. DataLoader & Checkpoint Load ────────────────────────────────────
+    # --- 5. Data Loading & Post-Resume ---
     dataset, loader = get_dataloader(
-        root_dir    = cfg["data_root"],
-        batch_size  = cfg.get("batch_size", 1),
-        clip_frames = cfg.get("clip_frames", 6),
-        num_workers = cfg.get("num_workers", 2),
-        apdh_stage  = 1 if current_stage == -1 else current_stage,
+        root_dir=cfg["data_root"],
+        batch_size=cfg.get("batch_size", 1),
+        clip_frames=cfg.get("clip_frames", 6),
+        num_workers=cfg.get("num_workers", 2),
+        apdh_stage=1 if current_stage == -1 else current_stage,
     )
 
     if cfg.get("resume_from"):
-        # Now that the optimizer has the right layers, load the states!
         load_checkpoint(cfg["resume_from"], dit, audio_enc, optimizer, scaler)
 
-    # ── 6. Memory optimization config ─────────────────────────────────────
-    aux_loss_prob  = cfg.get("aux_loss_prob", 0.25)      # compute PhD aux 25% of iters
-    warmup_no_aux  = cfg.get("warmup_no_aux", 500)       # first N iters: MSE only
-
-    # ── 7. Training loop ───────────────────────────────────────────────────
-    total_iters    = cfg.get("total_iters", 40000)
-    save_every     = cfg.get("save_every",  500)
-    log_every      = cfg.get("log_every",   25)
-    output_dir     = cfg.get("output_dir",  "checkpoints")
+    # --- 6. Execution Parameters ---
+    aux_loss_prob = cfg.get("aux_loss_prob", 0.25)
+    warmup_no_aux = cfg.get("warmup_no_aux", 500)
+    total_iters   = cfg.get("total_iters", 40000)
+    save_every    = cfg.get("save_every", 500)
+    log_every     = cfg.get("log_every", 25)
+    output_dir    = cfg.get("output_dir", "checkpoints")
 
     dit.train()
     audio_enc.train()
-
     data_iter = iter(loader)
     t0 = time.time()
 
     if device.type == "cuda":
-        print(f"\n[MEM] Before training loop: {torch.cuda.memory_reserved() / 1e9:.2f} GB reserved")
-        print(f"[MEM] Peak allocated: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB\n")
         torch.cuda.reset_peak_memory_stats()
+        print(f"\n[MEM] Pre-loop VRAM Reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
+    # --- 7. Main Training Loop ---
     pbar = tqdm(range(start_iter, total_iters), initial=start_iter, total=total_iters, desc="Training")
     for iteration in pbar:
 
-        # ── APDH curriculum check ──────────────────────────────────────────
+        # -- A. APDH Curriculum Check --
         stage, iterative_prob, n_layers = get_apdh_stage(iteration)
         if stage != current_stage:
             current_stage = stage
             dataset.set_apdh_stage(stage, iterative_prob)
             dit.unfreeze_backbone_top_n_layers(n_layers)
-            # Rebuild optimizer with newly unfrozen params
+            
+            # Re-initialize optimizer for newly unfrozen parameters
             trainable_params = (
-                [p for p in dit.parameters()       if p.requires_grad] +
+                [p for p in dit.parameters() if p.requires_grad] +
                 [p for p in audio_enc.parameters() if p.requires_grad]
             )
-            
-            # CRITICAL FIX: Force new trainable parameters to float32
             for p in trainable_params:
                 p.data = p.data.to(torch.float32)
                 
             optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=cfg.get("lr", 1e-5),
-                betas=(0.9, 0.999),
-                weight_decay=1e-2,
+                trainable_params, lr=cfg.get("lr", 1e-5), betas=(0.9, 0.999), weight_decay=1e-2
             )
-            tqdm.write(f"\n[APDH] → Stage {stage} | "
-                  f"trainable: {sum(p.numel() for p in trainable_params):,}")
+            tqdm.write(f"\n[APDH] Transitioned to Stage {stage} | Trainable Params: {sum(p.numel() for p in trainable_params):,}")
 
-        # ── Get batch ─────────────────────────────────────────────────────
+        # -- B. Batch Extraction --
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -337,68 +327,60 @@ def train(cfg: dict):
             data_iter = iter(loader)
             batch = next(data_iter)
 
-        video_latents  = batch["video_latents"].to(device, dtype=dtype)   # (B,16,T,96,96)
-        ref_latents    = batch["ref_latents"].to(device, dtype=dtype)     # (B,16,1,96,96)
-        pose_keypoints = batch["pose_keypoints"].to(device, dtype=dtype)  # (B,T,133,2)
-        audio_waveform = batch["audio_waveform"].to(device)               # (B,T_audio)
-        del batch  # free CPU memory
+        video_latents = batch["video_latents"].to(device, dtype=dtype)
+        ref_latents = batch["ref_latents"].to(device, dtype=dtype)
+        pose_keypoints = batch["pose_keypoints"].to(device, dtype=dtype)
+        audio_waveform = batch["audio_waveform"].to(device)
+        del batch
 
-        # ── Audio encoding (no_grad + detach to free Wav2Vec2 graph) ──────
+        # -- C. Audio Encoding --
         T = video_latents.shape[2]
         with torch.no_grad():
-            # Run Wav2Vec2 in FP32 (it frequently produces NaNs in FP16 autocast)
+            # Process Wav2Vec2 in FP32 to prevent FP16 NaNs, then cast back to required dtype
             audio_embeds = audio_enc(audio_waveform.float(), target_frames=T).detach()
-            # Cast the embeddings to match the DiT's dtype (FP16/BF16)
             audio_embeds = audio_embeds.to(dtype)
-        del audio_waveform  # free immediately
+        del audio_waveform
 
-        # ── Sample timestep + add noise ───────────────────────────────────
+        # -- D. Diffusion Forward Pass --
         t = torch.randint(0, scheduler.config.num_train_timesteps, (1,), device=device)
         t_val = int(t.item())
-        noise        = torch.randn_like(video_latents)
-        noisy_latent = scheduler.add_noise(
-            video_latents.float(), noise.float(), t
-        ).to(dtype)
+        noise = torch.randn_like(video_latents)
+        noisy_latent = scheduler.add_noise(video_latents.float(), noise.float(), t).to(dtype)
 
-        # ── Forward pass ──────────────────────────────────────────────────
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=dtype):
             noise_pred = dit(
-                video_latents  = noisy_latent,
-                ref_latents    = ref_latents,
-                timestep       = t.expand(video_latents.shape[0]),
-                audio_embeds   = audio_embeds,
-                pose_keypoints = pose_keypoints,
+                video_latents=noisy_latent,
+                ref_latents=ref_latents,
+                timestep=t.expand(video_latents.shape[0]),
+                audio_embeds=audio_embeds,
+                pose_keypoints=pose_keypoints,
             )
-        del ref_latents, pose_keypoints, audio_embeds  # free before loss
+        del ref_latents, pose_keypoints, audio_embeds
 
-        # ── Loss computation ──────────────────────────────────────────────
-        # Decide whether to compute expensive PhD auxiliary loss this iter
-        use_aux = (
-            iteration >= warmup_no_aux and
-            random.random() < aux_loss_prob
-        )
+        # -- E. Loss Computation --
+        use_aux = (iteration >= warmup_no_aux and random.random() < aux_loss_prob)
 
         if use_aux:
-            # Full PhD loss — requires VAE decode
+            # Requires expensive VAE Decode
             mid = T // 2
             z_target = video_latents[:, :, mid:mid+1, :, :].detach()
             target_rgb = vae_decode_frame(z_target, vae, device)
             del z_target
 
             total_loss, log_dict = loss_fn(
-                noise_pred   = noise_pred.float(),
-                actual_noise = noise.float(),
-                noisy_latent = noisy_latent.float(),
-                timestep     = t,
-                target_rgb   = target_rgb,
-                scheduler    = scheduler,
-                vae          = vae,
-                vae_device   = None,  # VAE stays on GPU
+                noise_pred=noise_pred.float(),
+                actual_noise=noise.float(),
+                noisy_latent=noisy_latent.float(),
+                timestep=t,
+                target_rgb=target_rgb,
+                scheduler=scheduler,
+                vae=vae,
+                vae_device=None,
             )
             del target_rgb
         else:
-            # MSE-only loss — no VAE decode, saves ~4 GB
+            # Efficient MSE-Only pass
             total_loss = F.mse_loss(noise_pred.float(), noise.float())
             log_dict = {
                 "Llatent": total_loss.item(),
@@ -407,9 +389,9 @@ def train(cfg: dict):
                 "total_loss": total_loss.item(),
             }
 
-        # ── Backprop ──────────────────────────────────────────────────────
+        # -- F. Backpropagation --
         if torch.isnan(total_loss):
-            print(f"[WARN] NaN loss at iter {iteration}! Skipping backward pass to protect model weights.")
+            tqdm.write(f"[WARN] NaN loss detected at iteration {iteration}! Skipping backward pass.")
         else:
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
@@ -417,51 +399,4 @@ def train(cfg: dict):
             scaler.step(optimizer)
             scaler.update()
 
-        # ── Free all large intermediates immediately after backward ────────
-        del noise_pred, noisy_latent, noise, video_latents, total_loss
-        torch.cuda.empty_cache()
-
-        # ── Logging ───────────────────────────────────────────────────────
-        pbar.set_postfix({
-            "stage": stage,
-            "loss": f"{log_dict['total_loss']:.4f}",
-            "phase": log_dict['phase']
-        })
-
-        if iteration % log_every == 0:
-            elapsed = time.time() - t0
-            iters_per_sec = log_every / max(elapsed, 1e-6)
-            t0 = time.time()
-            mem_gb = torch.cuda.memory_reserved() / 1e9 if device.type == "cuda" else 0.0
-            peak_gb = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
-            tqdm.write(
-                f"[{iteration:06d}] "
-                f"stage={stage} | "
-                f"phase={log_dict['phase']} | "
-                f"t={log_dict['t']:4d} | "
-                f"loss={log_dict['total_loss']:.4f} | "
-                f"Llatent={log_dict['Llatent']:.4f} | "
-                f"mem={mem_gb:.1f}GB peak={peak_gb:.1f}GB | "
-                f"{iters_per_sec:.2f} it/s"
-            )
-
-        # ── Checkpoint ────────────────────────────────────────────────────
-        if iteration % save_every == 0 and iteration > 0:
-            save_checkpoint(iteration, dit, audio_enc, optimizer, scaler, output_dir)
-            torch.cuda.empty_cache()
-
-    print("\n[TRAIN] Done.")
-    save_checkpoint(total_iters, dit, audio_enc, optimizer, scaler, output_dir)
-
-
-# ── Entry point ────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="training/config.yaml")
-    args = parser.parse_args()
-
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
-
-    train(cfg)
+        

@@ -11,30 +11,28 @@ from queue import Queue
 from pathlib import Path
 from diffusers import AutoencoderKLCogVideoX
 
-# --- CONFIGURATION ---
-REF_DIR        = "final_videos"
+# --- File Paths ---
+REF_DIR = "final_videos"
 REF_LATENT_DIR = "video_latents_final_videos"
 
-#RTX 3050 (4GB) optimized settings
-HEIGHT     = 768   # Reduced from 768 — huge VRAM saving, encode then upsample if needed
-WIDTH      = 768
-CHUNK_SIZE = 8     # Reduced from 16 — prevents mid-chunk OOM
-
+# --- VAE & Memory Configuration ---
+# Height/Width and Chunk Size are tuned to optimize VRAM usage on smaller GPUs
+HEIGHT = 768
+WIDTH = 768
+CHUNK_SIZE = 8
 START_INDEX = 8
 
-# Auto-Restart / Cooldown Settings
-BATCH_SIZE       = 3    # Reduced: respawn process more often to flush fragmented VRAM
-COOLDOWN_SECONDS = 20   # Slightly longer cooldown for a laptop GPU
-
-# --- Thermal monitoring threshold (Celsius) ---
-# Script will pause if GPU temp exceeds this before starting a new video
-GPU_TEMP_LIMIT = 85  # degrees C
+# --- Batching & Thermal Management ---
+# Processing in small batches allows the script to respawn the subprocess and flush VRAM
+BATCH_SIZE = 3
+COOLDOWN_SECONDS = 20
+GPU_TEMP_LIMIT = 85
 
 os.makedirs(REF_LATENT_DIR, exist_ok=True)
 
 
 def get_gpu_temp():
-    """Try to read GPU temperature via nvidia-smi."""
+    """Fetches the current GPU temperature using nvidia-smi."""
     try:
         import subprocess
         result = subprocess.run(
@@ -43,11 +41,11 @@ def get_gpu_temp():
         )
         return int(result.stdout.strip())
     except Exception:
-        return None  # Can't read temp, skip check
+        return None
 
 
 def wait_for_gpu_cooldown(limit=GPU_TEMP_LIMIT, check_interval=10):
-    """Block until GPU temperature drops below the limit."""
+    """Blocks execution if the GPU temperature exceeds the safety threshold."""
     while True:
         temp = get_gpu_temp()
         if temp is None or temp < limit:
@@ -57,7 +55,7 @@ def wait_for_gpu_cooldown(limit=GPU_TEMP_LIMIT, check_interval=10):
 
 
 def cpu_video_reader(cap, chunk_queue, chunk_size):
-    """Background thread: reads video frames and puts numpy chunks on a queue."""
+    """Background thread for reading video frames to prevent I/O blocking."""
     while True:
         chunk_frames = []
         for _ in range(chunk_size):
@@ -73,21 +71,21 @@ def cpu_video_reader(cap, chunk_queue, chunk_size):
         chunk_queue.put(np.stack(chunk_frames))
         del chunk_frames
 
-    chunk_queue.put(None)   # sentinel
+    # Sentinel value to indicate EOF
+    chunk_queue.put(None)
 
 
 def encode_chunk(vae, chunk_numpy, device, height, width):
-    """
-    Encode a single numpy chunk through the VAE.
-    Returns the latent on CPU. Handles OOM by halving the chunk.
-    """
+    """Encodes a video chunk through the VAE with automatic OutOfMemory (OOM) recovery."""
     chunk_tensor = torch.from_numpy(chunk_numpy).to(device)
     chunk_tensor = chunk_tensor.permute(0, 3, 1, 2).float() / 127.5 - 1.0
     chunk_tensor = F.interpolate(chunk_tensor, size=(height, width),
                                  mode='bilinear', align_corners=False)
     if device == "cuda":
         chunk_tensor = chunk_tensor.half()
-    chunk_tensor = chunk_tensor.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, T, H, W)
+        
+    # Reshape to (Batch, Channels, Time, Height, Width) for the VAE
+    chunk_tensor = chunk_tensor.permute(1, 0, 2, 3).unsqueeze(0)
 
     try:
         with torch.no_grad():
@@ -97,15 +95,15 @@ def encode_chunk(vae, chunk_numpy, device, height, width):
         return result
 
     except torch.cuda.OutOfMemoryError:
-        # ---- OOM Recovery: split chunk in half and encode separately ----
-        print("   [OOM] Splitting chunk in half to recover...")
+        # Fallback: Split the chunk in half along the time axis to recover from OOM
+        print("   [OOM] Splitting chunk to recover memory...")
         torch.cuda.empty_cache()
         gc.collect()
 
         T = chunk_tensor.shape[2]
         half = T // 2
         if half == 0:
-            raise  # Can't split further
+            raise
 
         parts = []
         for sub in [chunk_tensor[:, :, :half], chunk_tensor[:, :, half:]]:
@@ -120,7 +118,7 @@ def encode_chunk(vae, chunk_numpy, device, height, width):
         return result
 
     finally:
-        # Always clean up the input tensor
+        # Ensure memory is freed regardless of success or failure
         try:
             del chunk_tensor
         except Exception:
@@ -129,15 +127,18 @@ def encode_chunk(vae, chunk_numpy, device, height, width):
 
 
 def process_video_batch(video_paths, height, width, chunk_size):
-    """Runs in an isolated subprocess — loads VAE fresh, processes batch, exits cleanly."""
-
+    """
+    Runs in an isolated subprocess. Loading the VAE and processing here ensures
+    that VRAM fragmentation is cleared when the subprocess exits.
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"   [Process] Using device: {device}")
 
-    # Force deterministic allocator behavior to reduce fragmentation
+    # Force PyTorch to use expandable segments to reduce memory fragmentation
     if device == "cuda":
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+    # Initialize the CogVideoX VAE
     vae = AutoencoderKLCogVideoX.from_pretrained(
         "THUDM/CogVideoX-5b",
         subfolder="vae",
@@ -154,7 +155,7 @@ def process_video_batch(video_paths, height, width, chunk_size):
             print(f"   Skipping {vid_path.name} (already exists)")
             continue
 
-        # --- Thermal gate: don't start a hot video ---
+        # Prevent initiating a long task if the GPU is running too hot
         wait_for_gpu_cooldown()
 
         print(f"   -> Processing: {vid_path.name}")
@@ -167,7 +168,9 @@ def process_video_batch(video_paths, height, width, chunk_size):
               f"Duration: {total_frames/max(fps,1):.1f}s")
 
         encoded_chunks = []
-        chunk_queue = Queue(maxsize=3)   # slightly larger buffer
+        chunk_queue = Queue(maxsize=3)
+        
+        # Start background I/O thread
         reader_thread = threading.Thread(
             target=cpu_video_reader, args=(cap, chunk_queue, chunk_size)
         )
@@ -184,6 +187,8 @@ def process_video_batch(video_paths, height, width, chunk_size):
                 latent = encode_chunk(vae, chunk_numpy, device, height, width)
                 encoded_chunks.append(latent)
                 chunk_idx += 1
+                
+                # Periodic logging for visibility during long runs
                 if chunk_idx % 5 == 0:
                     temp = get_gpu_temp()
                     temp_str = f"  GPU: {temp}°C" if temp else ""
@@ -202,17 +207,19 @@ def process_video_batch(video_paths, height, width, chunk_size):
             print(f"      [WARN] No chunks encoded for {vid_path.name}. Skipping save.")
             continue
 
-        final_latent = torch.cat(encoded_chunks, dim=2)  # concat along time axis
+        # Reassemble the latent representation across the time dimension
+        final_latent = torch.cat(encoded_chunks, dim=2)
         np.save(str(out), final_latent.float().numpy())
         elapsed = time.time() - t0
         print(f"      Saved: {out.name}  shape={tuple(final_latent.shape)}  "
               f"time={elapsed:.1f}s")
 
+        # Memory cleanup after each video
         del encoded_chunks, final_latent
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Clean shutdown of this subprocess
+    # Final cleanup before subprocess exits
     del vae
     gc.collect()
     torch.cuda.empty_cache()
@@ -220,12 +227,15 @@ def process_video_batch(video_paths, height, width, chunk_size):
 
 
 if __name__ == '__main__':
+    # 'spawn' is required for CUDA multiprocessing to ensure clean memory boundaries
     multiprocessing.set_start_method('spawn', force=True)
 
     print("[INIT] Scanning for videos...")
     all_vids = sorted(Path(REF_DIR).glob("*.mp4"))[START_INDEX:]
-    pending  = [p for p in all_vids
-                if not (Path(REF_LATENT_DIR) / (p.stem + ".npy")).exists()]
+    
+    # Filter out videos that have already been processed
+    pending = [p for p in all_vids
+               if not (Path(REF_LATENT_DIR) / (p.stem + ".npy")).exists()]
     print(f"       {len(pending)} videos to process.\n")
 
     if not pending:
@@ -234,11 +244,13 @@ if __name__ == '__main__':
 
     total_batches = (len(pending) + BATCH_SIZE - 1) // BATCH_SIZE
 
+    # Group the workload into manageable batches
     for batch_num, i in enumerate(range(0, len(pending), BATCH_SIZE), start=1):
         batch = pending[i : i + BATCH_SIZE]
         names = [p.name for p in batch]
         print(f"[BATCH {batch_num}/{total_batches}] {names}")
 
+        # Spawn an isolated process for the batch
         p = multiprocessing.Process(
             target=process_video_batch,
             args=(batch, HEIGHT, WIDTH, CHUNK_SIZE)
@@ -249,7 +261,7 @@ if __name__ == '__main__':
         if p.exitcode != 0:
             print(f"   [WARN] Batch {batch_num} subprocess exited with code {p.exitcode}.")
 
-        # Cooldown between batches (skip after the last one)
+        # Enforce a hardware cooldown before starting the next batch
         if i + BATCH_SIZE < len(pending):
             print(f"[COOLDOWN] Sleeping {COOLDOWN_SECONDS}s between batches...\n")
             time.sleep(COOLDOWN_SECONDS)

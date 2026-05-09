@@ -3,39 +3,32 @@ import matplotlib.pyplot as plt
 import cv2
 from pathlib import Path
 
-POSE_DIR  = "pose_data_single"   # .npy files
-IMAGE_DIR = "reference_images_final_768"   # .jpg/.png files
+POSE_DIR  = "pose_data_single"   
+IMAGE_DIR = "reference_images_final_768"   
 
-# grab first pose file
 pose_path = sorted(Path(POSE_DIR).glob("*.npy"))[0]
 stem = pose_path.stem
 print(f"Loading: {pose_path}")
 
-# load pose data — each .npy is an object array of dicts (one per frame)
 pose_data = np.load(pose_path, allow_pickle=True)
 
-# handle 0-d wrapper
 if pose_data.ndim == 0:
     pose_data = pose_data.item()
 
-# if it's a single dict, wrap it in a list
 if isinstance(pose_data, dict):
     pose_data = [pose_data]
-
-# pick first frame
 frame = pose_data[0]
 
 if isinstance(frame, dict):
-    keypoints  = np.array(frame["keypoints"])       # (J, 2)  x, y in padded-768 space
+    keypoints  = np.array(frame["keypoints"])       
     scores     = np.array(frame.get("scores", np.ones(len(keypoints))))
-    pad_params = frame.get("pad_params", None)      # (top, left, new_h, new_w, orig_h, orig_w)
+    pad_params = frame.get("pad_params", None)      
     print(f"Frame 0 — keypoints shape: {keypoints.shape}, scores shape: {scores.shape}")
     if pad_params is not None:
         print(f"pad_params: top={pad_params[0]}, left={pad_params[1]}, "
               f"new_h={pad_params[2]}, new_w={pad_params[3]}, "
               f"orig_h={pad_params[4]}, orig_w={pad_params[5]}")
 else:
-    # fallback: treat as plain numeric array
     keypoints = np.array(frame)
     if keypoints.ndim == 1 and keypoints.shape[0] % 3 == 0:
         keypoints = keypoints.reshape(-1, 3)
@@ -45,13 +38,10 @@ else:
     print(f"Frame 0 — keypoints shape: {keypoints.shape}")
 
 # ----- determine the canvas size the pose was plotted on -----
-# Keypoints live in a TARGET_SIZE x TARGET_SIZE padded space (768x768 by default)
 if pad_params is not None:
     top, left, new_h, new_w, orig_h, orig_w = pad_params
-    # figure out TARGET_SIZE from pad_params
     canvas_size = new_h + 2 * top if new_h + 2 * top == new_w + 2 * left else max(new_h + 2 * top, new_w + 2 * left)
 else:
-    # fallback: infer from keypoint range
     canvas_size = 768
     top, left, new_h, new_w = 0, 0, canvas_size, canvas_size
 
@@ -72,7 +62,6 @@ img_orig = cv2.cvtColor(cv2.imread(str(img_path)), cv2.COLOR_BGR2RGB)
 h_orig, w_orig = img_orig.shape[:2]
 print(f"Original image size: {w_orig}x{h_orig}")
 
-# Resize & pad the reference image the same way the preprocessing did
 scale = canvas_size / max(h_orig, w_orig)
 rh, rw = int(h_orig * scale), int(w_orig * scale)
 resized = cv2.resize(img_orig, (rw, rh))

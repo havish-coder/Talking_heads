@@ -35,8 +35,8 @@ model = TalkingHeadsDiT(
     inner_dim              = 1920,
     audio_input_dim        = AUDIO_DIM,
     audio_tokens_per_frame = 4,
-    freeze_backbone        = False,   # random weights, nothing to freeze
-    gradient_checkpointing = False,   # off for quick test
+    freeze_backbone        = False,   
+    gradient_checkpointing = False,   
 ).to(device, dtype=dtype)
 
 print(f"\n{model.param_summary()}\n")
@@ -65,7 +65,7 @@ with torch.no_grad():
         ref_latents    = ref_latents,
         timestep       = timestep,
         audio_embeds   = ae,
-        pose_keypoints = None,        # dropped
+        pose_keypoints = None,        
     )
 assert noise_pred_no_pose.shape == (B, 16, T, H, W)
 print(f"[PASS] No-pose forward : noise_pred {tuple(noise_pred_no_pose.shape)}")

@@ -182,7 +182,7 @@ def expand_patch_embed_to_32ch(patch_embed_proj: nn.Conv2d) -> nn.Conv2d:
     """
     old = patch_embed_proj
     new = nn.Conv2d(
-        in_channels=32,               # 16 video + 16 reference
+        in_channels=32,               
         out_channels=old.out_channels,
         kernel_size=old.kernel_size,
         stride=old.stride,
@@ -190,9 +190,7 @@ def expand_patch_embed_to_32ch(patch_embed_proj: nn.Conv2d) -> nn.Conv2d:
         bias=old.bias is not None,
     )
     with torch.no_grad():
-        # Copy original weights into first 16 channels
         new.weight[:, :16, :, :] = old.weight.clone()
-        # Zero-init the reference frame channels
         new.weight[:, 16:, :, :] = 0.0
         if old.bias is not None:
             new.bias.data = old.bias.data.clone()
@@ -234,10 +232,10 @@ class TalkingHeadsDiT(nn.Module):
         Default: True (recommended for first training stage).
     """
 
-    COGVIDEOX_INNER_DIM      = 1920   # 30 × 64  (2B model)
+    COGVIDEOX_INNER_DIM      = 1920   
     COGVIDEOX_IN_CHANNELS    = 16
-    COGVIDEOX_NUM_LAYERS     = 30     # 2B has 30 blocks (5B had 42)
-    COGVIDEOX_TEXT_EMBED_DIM = 4096   # T5 slot — we repurpose via projection
+    COGVIDEOX_NUM_LAYERS     = 30     
+    COGVIDEOX_TEXT_EMBED_DIM = 4096   
 
     def __init__(
         self,
@@ -256,38 +254,31 @@ class TalkingHeadsDiT(nn.Module):
 
         self.inner_dim = inner_dim
         self.audio_tokens_per_frame = audio_tokens_per_frame
-
-        # ------------------------------------------------------------------
-        # 4a. Load pretrained CogVideoX-2B transformer backbone
-        #     We load the config and construct the model; weights are loaded
-        #     separately in the training script via from_pretrained.
-        #     The model is constructed here with the correct expanded in_channels.
-        # ------------------------------------------------------------------
         self.backbone = CogVideoXTransformer3DModel(
-            num_attention_heads=30,    # 2B: 30 heads × 64 = 1920 inner_dim
+            num_attention_heads=30,    
             attention_head_dim=64,
-            in_channels=32,            # 16 video + 16 ref (expanded)
-            out_channels=16,           # predict noise only in video channels
+            in_channels=32,            
+            out_channels=16,           
             flip_sin_to_cos=True,
             freq_shift=0,
             time_embed_dim=512,
-            text_embed_dim=4096,       # T5 dim (kept same; audio proj maps to inner_dim)
-            num_layers=30,             # 2B has 30 transformer blocks
+            text_embed_dim=4096,       
+            num_layers=30,             
             dropout=0.0,
             attention_bias=True,
-            sample_width=48,           # 96 / patch_size(2) = 48
+            sample_width=48,           
             sample_height=48,
-            sample_frames=24,          # CogVideoX default, overridden at fwd
+            sample_frames=24,          
             patch_size=2,
             temporal_compression_ratio=4,
-            max_text_seq_length=226,   # audio seq length ceiling
+            max_text_seq_length=226,   
             activation_fn="gelu-approximate",
             timestep_activation_fn="silu",
             norm_elementwise_affine=True,
             norm_eps=1e-5,
             spatial_interpolation_scale=1.875,
             temporal_interpolation_scale=1.0,
-            use_rotary_positional_embeddings=True,   # 2B also uses RoPE (same as 5B)
+            use_rotary_positional_embeddings=True,   
             use_learned_positional_embeddings=False,
         )
 
@@ -295,25 +286,19 @@ class TalkingHeadsDiT(nn.Module):
             self.backbone.enable_gradient_checkpointing()
 
         # ------------------------------------------------------------------
-        # 4b. New conditioning modules (all randomly initialised)
-        # ------------------------------------------------------------------
-        # AudioProjection: maps audio embeddings → (B, T*n_tokens, 4096)
-        # text_embed_dim of 2B backbone is 4096; the backbone's internal
-        # linear that mixes encoder_hidden_states works in that space.
+        # 4b. New conditioning modules 
+        # ------------------------------------------------------------
         self.audio_proj = AudioProjection(
             audio_dim=audio_input_dim,
-            inner_dim=4096,            # must match backbone text_embed_dim
+            inner_dim=4096,            
             n_tokens_per_frame=audio_tokens_per_frame,
             dropout=0.1,
         )
 
         self.pose_encoder = PoseEncoder(
-            inner_dim=inner_dim,       # pose residual lives in 1920-dim space
+            inner_dim=inner_dim,       
             dropout=pose_dropout,
         )
-
-        # Learnable scale for pose conditioning — starts at zero
-        # so pose has no effect at init, grows as training proceeds.
         self.pose_scale = nn.Parameter(torch.zeros(1))
 
         # ------------------------------------------------------------------
@@ -321,7 +306,6 @@ class TalkingHeadsDiT(nn.Module):
         # ------------------------------------------------------------------
         if freeze_backbone:
             self._freeze_backbone()
-        # New modules always train — they have no pretrained weights to protect.
 
     # ----------------------------------------------------------------------
     # Freezing helpers
@@ -370,10 +354,7 @@ class TalkingHeadsDiT(nn.Module):
                 "THUDM/CogVideoX-2b", freeze_backbone=True
             )
         """
-        # Build model with expanded 32ch input
         model = cls(**kwargs)
-
-        # Load original pretrained backbone (16ch) from HF
         print(f"[TalkingHeadsDiT] Loading pretrained weights from {pretrained_model_name_or_path}...")
         pretrained = CogVideoXTransformer3DModel.from_pretrained(
             pretrained_model_name_or_path,
@@ -381,13 +362,7 @@ class TalkingHeadsDiT(nn.Module):
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
         )
-
-        # ------------------------------------------------------------------
-        # Carefully copy weights: everything except patch_embed.proj
-        # (which changed from 16→32 channels)
-        # ------------------------------------------------------------------
         pretrained_sd = pretrained.state_dict()
-        # Free the pretrained model immediately — we only need the state_dict
         del pretrained
         gc.collect()
 
@@ -413,7 +388,6 @@ class TalkingHeadsDiT(nn.Module):
         model.backbone.load_state_dict(model_sd, strict=False)
         del model_sd
 
-        # Zero-init expansion for the skipped patch_embed.proj
         for key in keys_to_skip:
             if key == "patch_embed.proj.weight":
                 param_model = dict(model.backbone.named_parameters())[key]
@@ -474,27 +448,17 @@ class TalkingHeadsDiT(nn.Module):
 
         # ------------------------------------------------------------------
         # Step 1: Reference conditioning via channel concatenation
-        # Broadcast ref latent across time, concat on channel dim.
         # ------------------------------------------------------------------
-        ref_expanded = ref_latents.expand(B, 16, T, H, W)          # (B, 16, T, H, W)
-        x = torch.cat([video_latents, ref_expanded], dim=1)         # (B, 32, T, H, W)
-
-        # CogVideoX expects (B, T, C, H, W) — permute
-        x = x.permute(0, 2, 1, 3, 4)                               # (B, T, 32, H, W)
+        ref_expanded = ref_latents.expand(B, 16, T, H, W)          
+        x = torch.cat([video_latents, ref_expanded], dim=1)        
+        x = x.permute(0, 2, 1, 3, 4)                               
 
         # ------------------------------------------------------------------
         # Step 2: Audio conditioning
-        # Project audio embeds to inner_dim, use as encoder_hidden_states.
-        # This slot is normally T5 text — we repurpose it for audio.
-        # Shape must be (B, seq_len, inner_dim).
         # ------------------------------------------------------------------
         audio_tokens = self.audio_proj(audio_embeds)
-        # (B, T * audio_tokens_per_frame, inner_dim)
-
         # ------------------------------------------------------------------
         # Step 3: Backbone forward (CogVideoX DiT)
-        # The backbone does: patch_embed → 42 blocks → unpatchify
-        # Each block has joint attention over (video_tokens, audio_tokens).
         # ------------------------------------------------------------------
         backbone_out = self.backbone(
             hidden_states=x,
@@ -502,7 +466,6 @@ class TalkingHeadsDiT(nn.Module):
             timestep=timestep,
             return_dict=False,
         )
-        # backbone_out[0]: (B, T, 16, H, W) — note CogVideoX returns T before C
         noise_pred = backbone_out[0]
 
         # ------------------------------------------------------------------
@@ -517,25 +480,18 @@ class TalkingHeadsDiT(nn.Module):
         # This lets the model learn "shift the prediction based on pose" per frame.
         # ------------------------------------------------------------------
         if pose_keypoints is not None:
-            pose_feat = self.pose_encoder(pose_keypoints)     # (B, T, inner_dim)
+            pose_feat = self.pose_encoder(pose_keypoints)
 
-            # Project inner_dim → 16 output channels for noise space residual
             if not hasattr(self, '_pose_to_noise'):
-                # Lazy-init to avoid bloating __init__; created once
                 self._pose_to_noise = nn.Linear(
                     self.inner_dim, 16, bias=False
                 ).to(pose_feat.device, dtype=pose_feat.dtype)
                 nn.init.zeros_(self._pose_to_noise.weight)
 
-            pose_residual = self._pose_to_noise(pose_feat)    # (B, T, 16)
-            # Reshape to (B, T, 16, 1, 1) and broadcast
+            pose_residual = self._pose_to_noise(pose_feat)    
             pose_residual = pose_residual.unsqueeze(-1).unsqueeze(-1)
-            # Permute noise_pred to (B, T, 16, H, W) — CogVideoX already returns this
             noise_pred = noise_pred + self.pose_scale * pose_residual
-
-        # CogVideoX returns (B, T, 16, H, W). Convert back to (B, 16, T, H, W)
-        # to match the convention of your data pipeline.
-        noise_pred = noise_pred.permute(0, 2, 1, 3, 4)             # (B, 16, T, H, W)
+        noise_pred = noise_pred.permute(0, 2, 1, 3, 4)             
 
         return noise_pred
 
@@ -572,13 +528,12 @@ if __name__ == "__main__":
 
     print(f"Smoke test on device={device}, dtype={dtype}\n")
 
-    # --- Instantiate WITHOUT loading pretrained weights (for CI / shape test) ---
     model = TalkingHeadsDiT(
         inner_dim=1920,
         audio_input_dim=1920,
         audio_tokens_per_frame=1,
         pose_dropout=0.1,
-        gradient_checkpointing=False,   # off for smoke test speed
+        gradient_checkpointing=False,   
         freeze_backbone=True,
     ).to(device)
 
@@ -589,10 +544,10 @@ if __name__ == "__main__":
     print()
 
     # --- Dummy tensors matching your exact data shapes ---
-    B = 1       # batch size
-    T = 24      # 1 second at 24 fps
-    H = W = 96  # 768 / 8 (VAE spatial compression)
-    AUDIO_DIM = 1920   # 2B inner_dim
+    B = 1       
+    T = 24      
+    H = W = 96  
+    AUDIO_DIM = 1920
 
     video_latents  = torch.randn(B, 16, T, H, W, device=device, dtype=dtype)
     ref_latents    = torch.randn(B, 16, 1, H, W, device=device, dtype=dtype)
