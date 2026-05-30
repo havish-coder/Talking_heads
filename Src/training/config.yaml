@@ -1,0 +1,47 @@
+# training/config.yaml
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+pretrained_model : "THUDM/CogVideoX-2b"     # transformer + VAE + scheduler all from 2B
+wav2vec2_model   : "facebook/wav2vec2-base"
+data_root        : "../DATASET2/DATASET"     # re-encoded latents / pose / audio
+output_dir       : "../checkpoints"
+resume_from      : null
+
+# ── Model ────────────────────────────────────────────────────────────────--
+audio_dim   : 768       # Wav2Vec2 hidden size; fed to frame-aligned audio xattn
+use_lora    : true
+lora_rank   : 64
+lora_alpha  : 64
+# Audio cross-attention is injected on a spread of blocks (default: every other
+# block, set in talking_heads_dit.from_pretrained_cogvideox). audio_window = how
+# many neighbour latent frames each frame attends to (+/- window).
+
+# ── Data resolution ─────────────────────────────────────────────────────────
+# Re-encode latents at 480x480 -> 60x60 (native CogVideoX-2B scale) with
+#   python DATASET2/encode_2b.py --size 480
+# The old 96x96 latents run off-distribution; re-encode before training.
+
+# ── Training ───────────────────────────────────────────────────────────────
+total_iters  : 10000
+batch_size   : 1        # 2B + LoRA + 13-frame clips; raise if VRAM allows (A100)
+clip_frames  : 13       # LATENT frames ((13-1)*4+1 = 49 video frames, CogVideoX native)
+num_workers  : 4        # 0 for Windows, 4 for Linux (Lightning is Linux)
+lr           : 1e-4     # LoRA tolerates a higher LR than full fine-tune
+save_every   : 1000
+log_every    : 50
+
+# APDH curriculum compressed into a 10k-iter budget (default schedule is for 40k):
+#   pose-only -> audio-on -> drop head -> hands-only. Audio engages at stage 2.
+audio_on_from_stage : 2
+apdh_schedule :
+  - [0,    2500,   1, 0.00]
+  - [2500, 5000,   2, 0.05]
+  - [5000, 7500,   3, 0.10]
+  - [7500, 999999, 4, 0.20]
+
+# ── PhD Loss weights (from paper) ──────────────────────────────────────────
+lambda_pose   : 0.1
+lambda_detail : 0.1
+lambda_low    : 0.1
+
+# python training/train.py --config training/config.yaml

@@ -1,0 +1,37 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# ── Heavy data / binaries (upload to Lightning separately, NOT via git) ──────
+*.mp4
+*.m4a
+*.wav
+*.npy
+*.npz
+*.onnx
+*.zip
+*.pt
+*.ckpt
+*.safetensors
+*.jpg
+*.jpeg
+*.png
+
+# Dataset + model output directories
+DATASET2/DATASET/
+DATASET2/processed_dataset_wholebody/
+DATASET2/talkvid_sample/
+DATASET2/dwpose_models/
+DATASET/
+checkpoints/
+checkpoints_overfit/
+
+# Reference paper (5 MB, not needed on Lightning)
+Paper.pdf
+
+# ── Editor ──────────────────────────────────────────────────────────────────
+.vscode/
+.DS_Store

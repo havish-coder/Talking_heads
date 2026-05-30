@@ -1,0 +1,43 @@
+# overfit_config.yaml — DECISIVE sanity test: can the model memorise ~4 clips
+# and make lips track audio? If yes, architecture + pipeline are sound and the
+# rest is data/scale. If no, there is a deeper bug to fix before any full run.
+#
+# Make the 4-sample subset first (on Lightning):
+#   mkdir -p ../DATASET2/DATASET_overfit/{video_latents_final_videos,ref_latents,pose_data_single,audio}
+#   for s in 000 001 002 003; do
+#     cp ../DATASET2/DATASET/video_latents_final_videos/$s.npy ../DATASET2/DATASET_overfit/video_latents_final_videos/
+#     cp ../DATASET2/DATASET/ref_latents/$s.npy               ../DATASET2/DATASET_overfit/ref_latents/
+#     cp ../DATASET2/DATASET/pose_data_single/$s.npy          ../DATASET2/DATASET_overfit/pose_data_single/
+#     cp ../DATASET2/DATASET/audio/$s.m4a                     ../DATASET2/DATASET_overfit/audio/
+#   done
+# Run:  python training/train.py --config training/overfit_config.yaml
+
+pretrained_model : "THUDM/CogVideoX-2b"
+wav2vec2_model   : "facebook/wav2vec2-base"
+data_root        : "../DATASET2/DATASET_overfit"
+output_dir       : "../checkpoints_overfit"
+resume_from      : null
+
+audio_dim   : 768
+use_lora    : true
+lora_rank   : 64
+lora_alpha  : 64
+
+total_iters  : 1500
+batch_size   : 1
+clip_frames  : 13
+num_workers  : 0
+lr           : 1e-4
+save_every   : 500
+log_every    : 10
+
+lambda_pose   : 0.1
+lambda_detail : 0.1
+lambda_low    : 0.1
+
+# Fast curriculum so audio engages early (full run mutes it for thousands of iters):
+#   pose-only for 200 iters, then audio ON. No pose-dropout (we want memorisation).
+audio_on_from_stage : 2
+apdh_schedule :
+  - [0,    200,    1, 0.0]
+  - [200,  999999, 2, 0.0]
